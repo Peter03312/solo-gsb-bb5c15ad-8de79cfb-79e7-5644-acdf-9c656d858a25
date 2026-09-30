@@ -70,3 +70,24 @@ step "已签发标签仍不改写"
 req GET /labels/1
 step "凭据一次性：再次提交将被拒绝"
 req POST "/previews/$PID/commit"
+
+step "12. 增量变化（一）：初始化读取，同一状态下现存批次实时结论 + 游标"
+CUR="$(curl -sS "$BASE/changes/snapshot" | tee /tmp/snapshot.json \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+python3 -c 'import json;d=json.load(open("/tmp/snapshot.json"));print("batches:",d["batch_count"],"as_of_seq:",d["as_of_seq"])'
+
+step "13. 增量变化（二）：再登记一条已验证清洗（改变 OUT-OAT-1 实时溯源）"
+req POST /cleanings '{"equipment_id":"EQ-1","cleaned_at":"2026-01-02T09:40:00Z","verified":true}'
+
+step "14. 增量变化（三）：按游标分页拉取事件（含变更前后完整结论与依据）"
+PAGE="$(curl -sS "$BASE/changes/events?cursor=$CUR&limit=100")"
+echo "$PAGE" | python3 -m json.tool
+CUR="$(echo "$PAGE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')"
+echo "caught_up: $(echo "$PAGE" | python3 -c 'import sys,json;print(json.load(sys.stdin)["caught_up"])')"
+
+step "15. 增量变化（四）：标签签发不改实时溯源 -> 无事件，游标继续追上"
+req POST /batches/OUT-OAT-1/labels '{}'
+req GET "/changes/events?cursor=$CUR"
+
+step "16. 无效游标被拒绝（400）"
+curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/changes/events?cursor=not-a-valid-cursor"

@@ -60,6 +60,21 @@ CREATE TABLE IF NOT EXISTS labels (
     supersedes_id INTEGER REFERENCES labels(id),
     snapshot      TEXT NOT NULL
 );
+
+-- 溯源变化事件：业务写入与事件同一事务；seq 全局严格递增（同事务按 batch_id 排序）。
+-- before_view 为 NULL 表示新批次（无前态）；无实际变化的批次不产生事件。
+CREATE TABLE IF NOT EXISTS change_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    op          TEXT NOT NULL,   -- material_registered/declaration_corrected/
+                                 -- processing_registered/cleaning_registered/cleaning_revoked
+    via         TEXT NOT NULL,   -- direct | preview_commit
+    batch_id    TEXT NOT NULL,
+    kind        TEXT NOT NULL,   -- material | product（批次类型恒定）
+    op_detail   TEXT NOT NULL,   -- JSON：触发操作详情
+    before_view TEXT,            -- JSON：变更前完整结论与依据（新批次为 NULL）
+    after_view  TEXT NOT NULL,   -- JSON：变更后完整结论与依据
+    occurred_at TEXT NOT NULL
+);
 """
 
 
@@ -87,6 +102,19 @@ def init_db() -> None:
 def write_tx(conn: sqlite3.Connection):
     """写事务：BEGIN IMMEDIATE 保证“校验+写入”原子，失败回滚保持原状态。"""
     conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+@contextmanager
+def read_tx(conn: sqlite3.Connection):
+    """只读事务：BEGIN 取得事务开始时刻的一致性快照（WAL 下为 deferred），
+    事务期间其他写入对本事务不可见，保证“快照 + 高水位游标”取自同一状态。"""
+    conn.execute("BEGIN")
     try:
         yield conn
     except Exception:

@@ -15,7 +15,10 @@
 - **签发标签**冻结签发时刻的结论与依据，后续变更不改旧标签，
   可签发关联旧版（`supersedes_id`）的新标签；
 - 无效时序、来源环、设备时间重叠、批次来源冲突一律**拒绝并保持原状态**
-  （校验与写入在同一事务内，失败即回滚）。
+  （校验与写入在同一事务内，失败即回滚）；
+- 下游系统可通过**游标增量拉取溯源变化**：初始化读取返回同一状态下现存批次的
+  实时结论与游标，之后按游标分页读取变化事件；首页固定上界游标，读取期间的
+  新写入不会进入本次读取。
 
 ## 快速启动
 
@@ -89,6 +92,8 @@ pytest tests/ -q
 | GET | `/batches/{batch_id}/trace` | 实时溯源：每项过敏原/待确认的来源路径 + 依据 |
 | POST | `/batches/{batch_id}/labels` | 签发标签（可带 `supersedes_id` 关联旧版） |
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
+| GET | `/changes/snapshot` | 初始化读取：现存批次实时结论（含路径/依据）+ 增量游标 |
+| GET | `/changes/events?cursor=&limit=` | 按游标分页读取溯源变化事件（首页固定上界） |
 
 错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
@@ -136,6 +141,68 @@ curl -s $BASE/cleanings/1/revoke/preview -X POST
 
 # 用上一步返回的 preview_id 原子提交（返回实际影响）
 curl -s $BASE/previews/<preview_id>/commit -X POST
+```
+
+## 增量变化事件（游标拉取）
+
+下游系统按“**一次快照 + 后续事件**”增量获取过敏原溯源变化。
+
+### 1. 初始化读取 `GET /changes/snapshot`
+
+在**同一只读事务（一致性快照）**内返回：
+
+- `batches[]`：该状态下每个现存批次的**实时结论**（`conclusion`：过敏原、
+  待确认、逐项来源路径）与**依据**（`basis`：命中的原料声明版本、赖以清除
+  残留的清洗）；
+- `as_of_seq`：快照对应的全局高水位（当前最大事件序号，空库为 `0`）；
+- `cursor`：不透明游标，已定位到该高水位；随后据此增量补事件，不重不漏。
+
+### 2. 分页读取事件 `GET /changes/events?cursor=<游标>&limit=<1-1000>`
+
+每个事件包含：
+
+| 字段 | 说明 |
+|---|---|
+| `seq` | 全局严格递增序号（同次操作内按批次号排序） |
+| `op` | 触发操作：`material_registered` / `declaration_corrected` / `processing_registered` / `cleaning_registered` / `cleaning_revoked` |
+| `via` | `direct`（正式接口）或 `preview_commit`（预演凭据提交） |
+| `batch_id` / `kind` | 变化批次号与类型（`material` / `product`） |
+| `before` | 变更前完整结论与依据；**新批次为 `null`** |
+| `after` | 变更后完整结论与依据 |
+| `op_detail` | 触发操作详情（新声明版本、加工投入产出、清洗 id 等；凭据提交含 `preview_id`） |
+| `occurred_at` | 事件时间（UTC） |
+
+**事件生成规则（业务写入与事件在同一事务内）：**
+
+- 原料登记/更正、加工登记、清洗登记/撤销、预演凭据提交成功后，
+  仅对**新批次**或**完整结论/来源路径/依据确有变化**的批次生成事件；
+  同次操作按批次号排序；
+- **未验证清洗**不改变实时溯源，**标签签发**不改实时结论（旧标签始终不改），
+  均不产事件；
+- 仅预演不落库不产事件；事务失败（校验拒绝）整体回滚，也不产事件。
+
+**固定上界分页（读取期间写入不改变已开始的读取）：**
+
+- 首次携带快照游标（不带上界）拉取时，上界固定为读取开始时的高水位；
+  之后每页返回的游标都携带同一上界，期间任何新写入对本次读取不可见；
+- 读至上界后 `caught_up=true`，此时 `next_cursor` **不再带上界**；
+  下一次拉取自动固定新的上界，继续增量读取；
+- 响应同时给出 `as_of_seq`（当前高水位）与 `bounded_at_seq`（本次固定上界）。
+
+**无效游标一律 `400` 拒绝**（无法解析、版本不支持、位置/上界越界、
+位置超过固定上界等）；游标为不透明令牌，下游只需原样回传，无需解析。
+
+```bash
+BASE=http://localhost:8000
+
+# 初始化：取现存批次实时结论与游标
+curl -sS $BASE/changes/snapshot
+
+# 按游标增量拉取（limit 1-1000，默认 100）
+curl -sS "$BASE/changes/events?cursor=<游标>&limit=100"
+# -> {"events":[...], "next_cursor":"...", "caught_up":true,
+#     "as_of_seq":12, "bounded_at_seq":12}
+# caught_up=true 后用 next_cursor 继续轮询即可自动固定新上界
 ```
 
 ## 调用示例（curl）
@@ -192,17 +259,22 @@ curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
 curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
   -H 'Content-Type: application/json' -d '{"supersedes_id": 1}'
 curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
+
+# 8. 初始化增量读取：现存批次实时结论 + 游标
+curl -s $BASE/changes/snapshot
+# 9. 之后按游标分页拉取变化事件（游标原样回传；caught_up=true 即已追上）
+curl -s "$BASE/changes/events?cursor=<上一步的 cursor>&limit=100"
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、标签签发
-  db.py        # SQLite 连接、建表、写事务
+  main.py      # FastAPI 路由与错误映射（含增量快照/事件接口）
+  service.py   # 业务规则：校验、溯源计算、标签签发、预演、变化事件与游标分页
+  db.py        # SQLite 连接、建表、读/写事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 28 个端到端测试
+tests/test_app.py   # 42 个端到端测试
 examples/demo.sh    # 全流程 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

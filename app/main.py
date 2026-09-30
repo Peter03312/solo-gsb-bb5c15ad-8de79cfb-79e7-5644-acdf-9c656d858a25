@@ -5,7 +5,7 @@
 """
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import db, service
@@ -27,10 +27,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.1.0",
+    version="1.2.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
-                "设备残留与清洗、来源路径查询、标签签发，以及声明更正/清洗撤销的"
-                "预演与凭据提交。",
+                "设备残留与清洗、来源路径查询、标签签发、声明更正/清洗撤销的"
+                "预演与凭据提交，以及按游标增量拉取溯源变化事件。",
     lifespan=lifespan,
 )
 
@@ -184,3 +184,25 @@ def list_labels(batch_id: str, conn=Depends(get_conn)):
 @app.get("/labels/{label_id}", tags=["标签"])
 def get_label(label_id: int, conn=Depends(get_conn)):
     return service.get_label(conn, label_id)
+
+
+# ---------------------------------------------------------------- 增量变化事件
+
+@app.get("/changes/snapshot", tags=["增量变化"])
+def get_changes_snapshot(conn=Depends(get_conn)):
+    """初始化读取：返回同一状态下现存批次的实时结论（含来源路径）与依据，
+    以及当前高水位游标。随后携带该游标调用 /changes/events 增量补事件。"""
+    return service.changes_snapshot(conn)
+
+
+@app.get("/changes/events", tags=["增量变化"])
+def get_change_events(cursor: str | None = Query(
+                          None, description="上一次返回的不透明游标；"
+                                            "首次拉取可传快照接口返回的游标"),
+                      limit: int = Query(
+                          100, ge=1, le=1000, description="单页事件数（1-1000）"),
+                      conn=Depends(get_conn)):
+    """按游标分页读取溯源变化事件。首页将上界固定为读取开始时的高水位，
+    后续页沿用该上界，期间的新写入不会进入本次读取；caught_up=true 后
+    返回的游标不再带上界，下一次拉取自动固定新上界。无效游标返回 400。"""
+    return service.list_change_events(conn, cursor, limit)

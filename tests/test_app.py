@@ -19,8 +19,11 @@ def client():
     db.init_db()
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
-              "processing_outputs", "processings", "cleanings", "labels"]:
+              "processing_outputs", "processings", "cleanings", "labels",
+              "change_events"]:
         conn.execute(f"DELETE FROM {t}")
+    # 重置自增序号：测试内事件从 seq=1 开始（生产库不删表，序号持续递增）
+    conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('change_events', 'labels')")
     conn.close()
     with TestClient(app) as c:
         yield c
@@ -519,3 +522,265 @@ def test_preview_invalid_targets_and_errors(client):
     # 请求格式错误仍为 422（时间/字段校验保持一致）
     r = client.post("/materials/RM-OAT/declarations/preview", json={"allergens": "x"})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- 增量变化事件
+
+def _decode_cursor(token):
+    import base64
+    import json
+    return json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+
+
+def test_snapshot_initial_read_is_consistent(client):
+    # 空库：快照为空、高水位 0
+    s = client.get("/changes/snapshot").json()
+    assert s["batch_count"] == 0 and s["as_of_seq"] == 0
+    assert _decode_cursor(s["cursor"]) == {"v": 1, "a": 0}
+    _build_line(client)  # 2 原料 + 2 加工产出 = 4 个现存批次
+    s = client.get("/changes/snapshot").json()
+    assert s["batch_count"] == 4
+    assert {b["batch_id"] for b in s["batches"]} == {
+        "RM-MILK", "RM-OAT", "OUT-1", "OUT-2"}
+    out2 = [b for b in s["batches"] if b["batch_id"] == "OUT-2"][0]
+    assert out2["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert s["as_of_seq"] == _decode_cursor(s["cursor"])["a"]
+    # 快照游标只应看到新事件（本快照之后无事件 -> 空页且追上）
+    r = client.get(f"/changes/events?cursor={s['cursor']}")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["events"] == [] and d["caught_up"] is True
+    assert d["as_of_seq"] == s["as_of_seq"] == d["bounded_at_seq"]
+
+
+def test_new_batch_events_have_null_before(client):
+    r = material(client, "RM-1", allergens=["milk"])
+    assert r.status_code == 201
+    d = client.get("/changes/events").json()
+    assert len(d["events"]) == 1
+    e = d["events"][0]
+    assert e["seq"] == 1
+    assert e["op"] == "material_registered" and e["via"] == "direct"
+    assert e["batch_id"] == "RM-1" and e["kind"] == "material"
+    assert e["before"] is None  # 新批次前态为空
+    assert e["after"]["conclusion"]["allergens"] == ["milk"]
+    assert e["op_detail"]["batch_id"] == "RM-1"
+
+
+def test_processing_events_ordered_by_batch_id_with_residue_change(client):
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-OAT", allergens=["gluten"])
+    # 同设备先有 P0 -> 再登记 P1（OUT-2 经残留获得 milk）
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-MILK"], ["ZZZ-1"]).status_code == 201
+    d = client.get("/changes/events").json()
+    assert [e["batch_id"] for e in d["events"]] == ["RM-MILK", "RM-OAT", "ZZZ-1"]
+    assert processing(client, "P2", "EQ-1",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["RM-OAT"], ["AAA-2"]).status_code == 201
+    # 同次操作仅新批次一个事件（既有批次 ZZZ-1 的实时溯源未变），按批次号
+    after = client.get(
+        "/changes/events", params={"cursor": d["next_cursor"]}).json()
+    assert [e["batch_id"] for e in after["events"]] == ["AAA-2"]
+    e = after["events"][0]
+    assert e["op"] == "processing_registered"
+    assert e["op_detail"]["processing_id"] == "P2"
+    assert e["after"]["conclusion"]["allergens"] == ["gluten", "milk"]
+
+
+def test_verified_cleaning_event_for_affected_batch_only(client):
+    _build_line(client)
+    r = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True})
+    assert r.status_code == 201
+    cid = r.json()["id"]
+    d = client.get("/changes/events", params={"limit": 100}).json()
+    evs = [e for e in d["events"] if e["op"] == "cleaning_registered"]
+    assert [e["batch_id"] for e in evs] == ["OUT-2"]  # 仅确有变化的下游批次
+    e = evs[0]
+    assert e["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert e["after"]["conclusion"]["allergens"] == ["gluten"]
+    assert e["op_detail"] == {
+        "cleaning_id": cid, "equipment_id": "EQ-1",
+        "cleaned_at": "2026-01-02T09:30:00Z", "verified": True}
+
+
+def test_unverified_cleaning_produces_no_events(client):
+    _build_line(client)
+    before = client.get("/changes/events", params={"limit": 100}).json()
+    hwm = before["as_of_seq"]
+    r = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": False})
+    assert r.status_code == 201
+    after = client.get("/changes/events").json()
+    assert after["as_of_seq"] == hwm  # 未验证清洗未改变实时溯源 -> 无事件
+
+
+def test_label_issue_produces_no_events(client):
+    _build_line(client)
+    s = client.get("/changes/snapshot").json()
+    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    d = client.get(f"/changes/events?cursor={s['cursor']}").json()
+    assert d["events"] == []  # 标签签发不改变实时溯源，旧标签始终不改
+
+
+def test_direct_correction_events_carry_full_views(client):
+    _build_line(client)
+    r = client.post("/materials/RM-OAT/declarations",
+                    json={"allergens": ["gluten", "sesame"]})
+    assert r.status_code == 201
+    d = client.get("/changes/events", params={"limit": 100}).json()
+    evs = [e for e in d["events"] if e["op"] == "declaration_corrected"]
+    # 同次操作按批次号排序：目标原料本身（依据版本变化）+ 下游 OUT-2
+    assert [e["batch_id"] for e in evs] == ["OUT-2", "RM-OAT"]
+    by_batch = {e["batch_id"]: e for e in evs}
+    e = by_batch["OUT-2"]
+    assert e["via"] == "direct"
+    assert e["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert e["after"]["conclusion"]["allergens"] == ["gluten", "milk", "sesame"]
+    # 依据完整：命中声明版本 v1 -> v2
+    versions = {x["batch_id"]: x["version"]
+                for x in e["after"]["basis"]["material_declarations"]}
+    assert versions["RM-OAT"] == 2
+    rm = by_batch["RM-OAT"]
+    assert rm["before"]["conclusion"]["allergens"] == ["gluten"]
+    assert rm["after"]["conclusion"]["allergens"] == ["gluten", "sesame"]
+
+
+def test_direct_revocation_event_restores_residue(client):
+    _build_line(client)
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    r = client.post(f"/cleanings/{cid}/revoke")
+    assert r.status_code == 200
+    d = client.get("/changes/events", params={"limit": 100}).json()
+    evs = [e for e in d["events"] if e["op"] == "cleaning_revoked"]
+    assert [e["batch_id"] for e in evs] == ["OUT-2"]
+    e = evs[0]
+    assert e["before"]["conclusion"]["allergens"] == ["gluten"]
+    assert e["after"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert e["op_detail"]["cleaning_id"] == cid
+
+
+def test_preview_commit_emits_events_preview_does_not(client):
+    _build_line(client)
+    # 预演不落库、不产事件
+    prev = client.post("/materials/RM-OAT/declarations/preview",
+                       json={"allergens": ["sesame"]}).json()
+    s = client.get("/changes/snapshot").json()
+    assert s["as_of_seq"] == _decode_cursor(s["cursor"])["a"]
+    # 提交成功 -> 与正式更正同口径事件，但 via=preview_commit
+    r = client.post(f"/previews/{prev['preview_id']}/commit")
+    assert r.status_code == 200
+    d = client.get(f"/changes/events?cursor={s['cursor']}").json()
+    assert [e["batch_id"] for e in d["events"]] == ["OUT-2", "RM-OAT"]
+    e = [x for x in d["events"] if x["batch_id"] == "OUT-2"][0]
+    assert e["op"] == "declaration_corrected" and e["via"] == "preview_commit"
+    assert e["op_detail"]["preview_id"] == prev["preview_id"]
+    assert e["after"]["conclusion"]["allergens"] == ["milk", "sesame"]
+
+
+def test_failed_write_emits_no_events(client):
+    material(client, "RM-1")
+    hwm0 = client.get("/changes/events").json()["as_of_seq"]
+    # 无效加工（投入不存在）整体回滚：无业务写入也无事件
+    r = processing(client, "P-BAD", "EQ-1",
+                   "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                   ["GHOST"], ["OUT-BAD"])
+    assert r.status_code == 400
+    assert client.get("/changes/events").json()["as_of_seq"] == hwm0
+    # 重复登记原料冲突：无事件
+    assert material(client, "RM-1").status_code == 409
+    assert client.get("/changes/events").json()["as_of_seq"] == hwm0
+
+
+def test_pagination_pins_fixed_upper_bound(client):
+    material(client, "RM-1", allergens=["milk"])
+    material(client, "RM-0", allergens=["egg"])  # 共 2 个事件，单页 1 条
+    first = client.get("/changes/events", params={"limit": 1}).json()
+    assert len(first["events"]) == 1 and first["events"][0]["seq"] == 1
+    bound = first["bounded_at_seq"]
+    assert bound == 2 and first["caught_up"] is False
+    cur = _decode_cursor(first["next_cursor"])
+    assert cur == {"v": 1, "a": 1, "b": 2}  # 翻页游标固定了上界
+    # 读取进行中发生新写入
+    material(client, "RM-2", allergens=["soy"])
+    page2 = client.get("/changes/events",
+                       params={"cursor": first["next_cursor"], "limit": 1}).json()
+    # 固定上界内的最后一条；新写入（seq=3）不得泄漏
+    assert [e["seq"] for e in page2["events"]] == [2]
+    assert page2["caught_up"] is True
+    assert page2["bounded_at_seq"] == bound
+    nxt = _decode_cursor(page2["next_cursor"])
+    assert nxt == {"v": 1, "a": 2}  # 追上后游标不再带上界
+    # 下一轮自动固定新上界，可见 seq=3
+    page3 = client.get("/changes/events",
+                       params={"cursor": page2["next_cursor"]}).json()
+    assert [e["seq"] for e in page3["events"]] == [3]
+    assert page3["bounded_at_seq"] == 3 and page3["caught_up"] is True
+
+
+def test_invalid_cursors_rejected(client):
+    material(client, "RM-1", allergens=["milk"])
+    for bad in ["!!!not-base64!!!", "bm90anNvbg",
+                "eyJhIjogMX0"]:  # 分别为：非 base64 / 非 JSON / 缺版本字段
+        r = client.get("/changes/events", params={"cursor": bad})
+        assert r.status_code == 400, bad
+    # after 超过当前高水位 -> 拒绝
+    r = client.get("/changes/events", params={"cursor": _make_cursor(999, None)})
+    assert r.status_code == 400
+    # after > bound -> 拒绝
+    r = client.get("/changes/events", params={"cursor": _make_cursor(5, 3)})
+    assert r.status_code == 400
+    # 固定上界超过当前高水位 -> 拒绝
+    r = client.get("/changes/events", params={"cursor": _make_cursor(0, 999)})
+    assert r.status_code == 400
+
+
+def _make_cursor(after, bound):
+    import base64
+    import json
+    body = {"v": 1, "a": after}
+    if bound is not None:
+        body["b"] = bound
+    raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def test_snapshot_plus_events_reconstructs_current_state(client):
+    material(client, "RM-1", allergens=["milk"])
+    assert processing(client, "P1", "EQ-1",
+                      "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+                      ["RM-1"], ["OUT-1"]).status_code == 201
+    # 初始化读取
+    s = client.get("/changes/snapshot").json()
+    state = {b["batch_id"]: b["conclusion"] for b in s["batches"]}
+    # 之后发生：更正 + 新加工
+    client.post("/materials/RM-1/declarations",
+                json={"allergens": ["milk", "egg"]})
+    assert processing(client, "P2", "EQ-1",
+                      "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+                      ["RM-1"], ["OUT-2"]).status_code == 201
+    # 按游标补完全部事件
+    cursor = s["cursor"]
+    while True:
+        d = client.get("/changes/events",
+                       params={"cursor": cursor, "limit": 1}).json()
+        for e in d["events"]:
+            if e["before"] is None:
+                state[e["batch_id"]] = e["after"]["conclusion"]
+            else:
+                state[e["batch_id"]] = e["after"]["conclusion"]
+        cursor = d["next_cursor"]
+        if d["caught_up"]:
+            break
+    # 重建结果与最终实时结论一致
+    live1 = client.get("/batches/OUT-1/trace").json()
+    live2 = client.get("/batches/OUT-2/trace").json()
+    assert state["OUT-1"]["allergens"] == live1["allergens"] == ["egg", "milk"]
+    assert state["OUT-2"]["allergens"] == live2["allergens"] == ["egg", "milk"]

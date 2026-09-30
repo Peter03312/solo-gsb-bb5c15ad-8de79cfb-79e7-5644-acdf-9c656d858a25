@@ -1,11 +1,11 @@
 """HTTP API 层：路由、依赖注入、错误映射。
 
-错误约定：400 无效时序/参数，404 资源不存在，409 冲突（重叠/来源环/重复批次/重复撤销）。
+错误约定：400 无效时序/参数（含无效游标），404 资源不存在，409 冲突（重叠/来源环/重复批次/重复撤销）。
 所有写操作在单事务内完成，拒绝时回滚、保持原状态。
 """
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import db, service
@@ -27,10 +27,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.1.0",
+    version="1.2.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
-                "设备残留与清洗、来源路径查询、标签签发，以及声明更正/清洗撤销的"
-                "预演与凭据提交。",
+                "设备残留与清洗、来源路径查询、标签签发，声明更正/清洗撤销的"
+                "预演与凭据提交，以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
 
@@ -165,6 +165,30 @@ def commit_preview(preview_id: str, conn=Depends(get_conn)):
 def trace_batch(batch_id: str, conn=Depends(get_conn)):
     """实时溯源：返回每项过敏原与待确认状态的来源路径及当前有效依据。"""
     return service.trace_response(conn, batch_id)
+
+
+# ---------------------------------------------------------------- 变更事件订阅
+
+@app.get("/changes/snapshot", tags=["变更订阅"])
+def get_changes_snapshot(conn=Depends(get_conn)):
+    """初始化读取：同一状态下的现存批次实时结论（含依据）与游标。
+    之后以该游标调用 /changes/events 即可不重不漏地接续增量变化。"""
+    return service.changes_snapshot(conn)
+
+
+@app.get("/changes/events", tags=["变更订阅"])
+def get_change_events(cursor: int = 0,
+                      limit: int = Query(default=100, ge=1, le=1000),
+                      upper: int | None = None,
+                      conn=Depends(get_conn)):
+    """按游标分页读取变更事件（seq 升序）。
+
+    - `cursor`：起始游标（快照游标或上一页的 next_cursor），返回 seq > cursor 的事件；
+    - `upper`：本次分页会话的固定上界，首页缺省取当前最大序号，翻页时原样回传，
+      分页期间的新写入不会进入已开始的读取；
+    - 无效游标（负数、超过当前最大序号、upper < cursor 等）返回 400。
+    """
+    return service.list_change_events(conn, cursor, limit, upper)
 
 
 # ---------------------------------------------------------------- 标签

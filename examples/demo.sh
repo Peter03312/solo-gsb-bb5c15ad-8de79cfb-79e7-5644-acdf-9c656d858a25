@@ -70,3 +70,34 @@ step "已签发标签仍不改写"
 req GET /labels/1
 step "凭据一次性：再次提交将被拒绝"
 req POST "/previews/$PID/commit"
+
+step "12. 变更订阅：初始化读取（现存批次实时结论 + 游标，同一状态）"
+SNAP="$(curl -sS "$BASE/changes/snapshot")"
+echo "$SNAP" | python3 -c 'import sys,json; d=json.load(sys.stdin)
+print("cursor =", d["cursor"])
+for b in d["batches"]:
+    c = b["conclusion"]
+    print(" ", b["batch_id"], "(" + b["kind"] + "):",
+          "allergens =", c["allergens"], "pending =", c["pending"])'
+CURSOR="$(echo "$SNAP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')"
+
+step "13. 触发一次变更（声明更正），按游标增量读取事件"
+req POST /materials/RM-OAT/declarations '{"allergens":["gluten","sesame","soy","mustard"]}'
+req GET "/changes/events?cursor=$CURSOR&limit=10"
+
+step "14. 分页读取：固定上界 upper，翻页期间的新写入不进入本次读取"
+PAGE1="$(curl -sS "$BASE/changes/events?cursor=0&limit=2")"
+echo "$PAGE1" | python3 -c 'import sys,json; d=json.load(sys.stdin)
+print("page1:", [(e["seq"], e["batch_id"]) for e in d["events"]], "next_cursor =", d["next_cursor"], "upper =", d["upper"])'
+NEXT="$(echo "$PAGE1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')"
+UPPER="$(echo "$PAGE1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["upper"])')"
+req POST /materials '{"batch_id":"RM-LATE","allergens":["peanut"],"declared_at":"2026-01-03T06:00:00Z"}'
+step "带固定上界翻页（本次读取看不到刚写入的 RM-LATE）"
+PAGE2="$(curl -sS "$BASE/changes/events?cursor=$NEXT&limit=1000&upper=$UPPER")"
+echo "$PAGE2" | python3 -c 'import sys,json; d=json.load(sys.stdin)
+print("page2:", [(e["seq"], e["batch_id"]) for e in d["events"]])
+print("has_more =", d["has_more"], " next_cursor =", d["next_cursor"], " latest =", d["latest"], "（latest > upper 表示期间有新写入）")'
+step "本轮读完（has_more=false）后开启新一轮：不传 upper，从 next_cursor 续读（含 RM-LATE）"
+req GET "/changes/events?cursor=$UPPER&limit=2"
+step "无效游标被拒绝（400）"
+req GET "/changes/events?cursor=999999"

@@ -19,8 +19,10 @@ def client():
     db.init_db()
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
-              "processing_outputs", "processings", "cleanings", "labels"]:
+              "processing_outputs", "processings", "cleanings", "labels",
+              "trace_events"]:
         conn.execute(f"DELETE FROM {t}")
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.close()
     with TestClient(app) as c:
         yield c
@@ -519,3 +521,249 @@ def test_preview_invalid_targets_and_errors(client):
     # 请求格式错误仍为 422（时间/字段校验保持一致）
     r = client.post("/materials/RM-OAT/declarations/preview", json={"allergens": "x"})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- 变更事件流
+
+def _events(c, cursor=0, **params):
+    r = c.get("/changes/events", params={"cursor": cursor, **params})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _cursor(c):
+    return c.get("/changes/snapshot").json()["cursor"]
+
+
+def test_snapshot_empty_then_material_register_event(client):
+    snap = client.get("/changes/snapshot").json()
+    assert snap["cursor"] == 0 and snap["batches"] == []
+    material(client, "RM-1", allergens=["milk"])
+    # 初始化读取：同一状态下的现存批次实时结论与游标
+    snap2 = client.get("/changes/snapshot").json()
+    assert [b["batch_id"] for b in snap2["batches"]] == ["RM-1"]
+    assert snap2["batches"][0]["kind"] == "material"
+    assert snap2["batches"][0]["conclusion"]["allergens"] == ["milk"]
+    # 新批次事件：前态为空
+    page = _events(client, snap["cursor"])
+    assert len(page["events"]) == 1
+    ev = page["events"][0]
+    assert ev["seq"] == 1 and ev["op"] == "material_register"
+    assert ev["batch_id"] == "RM-1" and ev["kind"] == "material"
+    assert ev["before"] is None
+    assert ev["after"]["conclusion"]["allergens"] == ["milk"]
+    assert ev["after"]["basis"]["material_declarations"][0]["version"] == 1
+    assert page["next_cursor"] == ev["seq"] == snap2["cursor"]
+    assert page["has_more"] is False
+
+
+def test_processing_events_and_residue_side_effects(client):
+    material(client, "RM-MILK", allergens=["milk"])
+    material(client, "RM-OAT", allergens=["gluten"])
+    processing(client, "P1", "EQ-1",
+               "2026-01-02T08:00:00Z", "2026-01-02T09:00:00Z",
+               ["RM-MILK"], ["OUT-1"])
+    cursor = _cursor(client)
+    # P2：新批次 OUT-2 事件（含设备残留 milk）
+    processing(client, "P2", "EQ-1",
+               "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z",
+               ["RM-OAT"], ["OUT-2"])
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2"]
+    ev = page["events"][0]
+    assert ev["op"] == "processing_register"
+    assert ev["op_ref"] == {"processing_id": "P2"}
+    assert ev["before"] is None
+    assert ev["after"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    # 乱序补登 P1.5（落在 P1/P2 之间）：OUT-2 残留来源改变 -> 既有批次也产事件
+    material(client, "RM-X", allergens=["sesame"])
+    cursor = _cursor(client)
+    processing(client, "P15", "EQ-1",
+               "2026-01-02T09:10:00Z", "2026-01-02T09:50:00Z",
+               ["RM-X"], ["OUT-15"])
+    page = _events(client, cursor)
+    by_batch = {e["batch_id"]: e for e in page["events"]}
+    assert set(by_batch) == {"OUT-15", "OUT-2"}
+    assert by_batch["OUT-15"]["before"] is None
+    # P15 自身继承 P1 的 milk 残留（P1/P15 间无清洗），P2 改从 OUT-15 继承残留：
+    # OUT-2 结论增加 sesame，且 milk 的来源路径改经 OUT-15
+    out2 = by_batch["OUT-2"]
+    assert out2["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert out2["after"]["conclusion"]["allergens"] == ["gluten", "milk", "sesame"]
+    milk_path = out2["after"]["conclusion"]["allergen_paths"]["milk"][0]
+    assert [s.get("batch_id") for s in milk_path] == ["RM-MILK", "OUT-1", "OUT-15", "OUT-2"]
+    # 同次操作的事件按批次号排序
+    seqs = [e["seq"] for e in page["events"]]
+    assert seqs == sorted(seqs)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-15", "OUT-2"]
+
+
+def test_declaration_correction_events_sorted_with_basis(client):
+    _build_line(client)
+    cursor = _cursor(client)
+    client.post("/materials/RM-OAT/declarations",
+                json={"allergens": ["gluten", "sesame"]})
+    page = _events(client, cursor)
+    # 仅结论/依据确有变化的批次：RM-OAT 自身 + 下游 OUT-2（OUT-1 不依赖 RM-OAT）
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2", "RM-OAT"]
+    assert all(e["op"] == "declaration_correction" for e in page["events"])
+    by_batch = {e["batch_id"]: e for e in page["events"]}
+    rm = by_batch["RM-OAT"]
+    assert rm["before"]["basis"]["material_declarations"][0]["version"] == 1
+    assert rm["after"]["basis"]["material_declarations"][0]["version"] == 2
+    out2 = by_batch["OUT-2"]
+    assert out2["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert out2["after"]["conclusion"]["allergens"] == ["gluten", "milk", "sesame"]
+
+
+def test_cleaning_events_only_when_trace_changes(client):
+    _build_line(client)
+    cursor = _cursor(client)
+    # 未验证清洗不改变实时溯源 -> 无事件
+    client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": False})
+    assert _events(client, cursor)["events"] == []
+    # 窗口外的已验证清洗不改变实时溯源 -> 无事件
+    client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T12:00:00Z",
+        "verified": True})
+    assert _events(client, cursor)["events"] == []
+    # 窗口内的已验证清洗 -> 残留清除，OUT-2 产生事件
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2"]
+    ev = page["events"][0]
+    assert ev["op"] == "cleaning_register" and ev["op_ref"] == {"cleaning_id": cid}
+    assert ev["before"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert ev["after"]["conclusion"]["allergens"] == ["gluten"]
+    assert ev["after"]["basis"]["cleanings"][0]["id"] == cid
+    # 撤销 -> 残留恢复，再次产生事件
+    cursor = _cursor(client)
+    client.post(f"/cleanings/{cid}/revoke")
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2"]
+    ev = page["events"][0]
+    assert ev["op"] == "cleaning_revocation"
+    assert ev["after"]["conclusion"]["allergens"] == ["gluten", "milk"]
+    assert ev["after"]["basis"]["cleanings"] == []
+
+
+def test_label_issuance_produces_no_events(client):
+    _build_line(client)
+    cursor = _cursor(client)
+    assert client.post("/batches/OUT-2/labels", json={}).status_code == 201
+    assert _events(client, cursor)["events"] == []
+
+
+def test_preview_dry_run_no_events_commit_produces(client):
+    _build_line(client)
+    cursor = _cursor(client)
+    prev = client.post("/materials/RM-OAT/declarations/preview",
+                       json={"allergens": ["gluten", "sesame"]}).json()
+    # 仅预演不产事件
+    assert _events(client, cursor)["events"] == []
+    # 凭据提交成功 -> 与直接更正同类型事件，via 标记来源
+    assert client.post(f"/previews/{prev['preview_id']}/commit").status_code == 200
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2", "RM-OAT"]
+    assert all(e["op"] == "declaration_correction" for e in page["events"])
+    assert all(e["op_ref"]["via"] == "preview_commit" for e in page["events"])
+    # 清洗撤销的预演提交同样产事件
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    cursor = _cursor(client)
+    prev = client.post(f"/cleanings/{cid}/revoke/preview").json()
+    assert _events(client, cursor)["events"] == []
+    client.post(f"/previews/{prev['preview_id']}/commit")
+    page = _events(client, cursor)
+    assert [e["batch_id"] for e in page["events"]] == ["OUT-2"]
+    assert page["events"][0]["op"] == "cleaning_revocation"
+    assert page["events"][0]["op_ref"]["via"] == "preview_commit"
+
+
+def test_failed_writes_produce_no_events(client):
+    _build_line(client)
+    cursor = _cursor(client)
+    # 各类被拒绝的写入：时序/重叠/重复批次/未知资源/重复撤销
+    assert processing(client, "P-BAD", "EQ-1",
+                      "2026-01-02T08:30:00Z", "2026-01-02T09:30:00Z",
+                      ["RM-OAT"], ["OUT-X"]).status_code == 409
+    assert material(client, "RM-MILK").status_code == 409
+    assert client.post("/cleanings/999/revoke").status_code == 404
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    client.post(f"/cleanings/{cid}/revoke")
+    assert client.post(f"/cleanings/{cid}/revoke").status_code == 409
+    cursor2 = _cursor(client)
+    assert client.post(f"/previews/bogus/commit").status_code == 409
+    # 只有成功的清洗登记与撤销产生了事件，失败写入均无事件
+    page = _events(client, cursor)
+    assert [(e["op"], e["batch_id"]) for e in page["events"]] == [
+        ("cleaning_register", "OUT-2"), ("cleaning_revocation", "OUT-2")]
+    assert _events(client, cursor2)["events"] == []
+
+
+def test_pagination_fixed_upper_bound(client):
+    for i in range(5):
+        material(client, f"RM-{i}", allergens=[f"a{i}"])
+    first = _events(client, 0, limit=2)
+    assert [e["batch_id"] for e in first["events"]] == ["RM-0", "RM-1"]
+    assert first["has_more"] is True
+    upper = first["upper"]
+    # 分页进行中又有新写入：固定上界使其不进入本次读取
+    material(client, "RM-NEW", allergens=["x"])
+    second = _events(client, first["next_cursor"], limit=2, upper=upper)
+    assert [e["batch_id"] for e in second["events"]] == ["RM-2", "RM-3"]
+    assert second["upper"] == upper
+    third = _events(client, second["next_cursor"], limit=2, upper=upper)
+    assert [e["batch_id"] for e in third["events"]] == ["RM-4"]
+    assert third["has_more"] is False
+    assert third["latest"] > third["upper"]  # 提示期间有新写入
+    # 新一轮（不传 upper）能读到 RM-NEW
+    fourth = _events(client, third["next_cursor"])
+    assert [e["batch_id"] for e in fourth["events"]] == ["RM-NEW"]
+    assert fourth["has_more"] is False
+
+
+def test_invalid_cursor_rejected(client):
+    material(client, "RM-1")
+    assert client.get("/changes/events", params={"cursor": -1}).status_code == 400
+    assert client.get("/changes/events", params={"cursor": 999}).status_code == 400
+    assert client.get("/changes/events",
+                      params={"cursor": 0, "upper": 999}).status_code == 400
+    assert client.get("/changes/events",
+                      params={"cursor": 1, "upper": 0}).status_code == 400
+    assert client.get("/changes/events", params={"cursor": "abc"}).status_code == 422
+    assert client.get("/changes/events", params={"limit": 0}).status_code == 422
+
+
+def test_events_replay_matches_snapshot(client):
+    _build_line(client)
+    client.post("/materials/RM-OAT/declarations",
+                json={"allergens": ["gluten", "sesame"]})
+    cid = client.post("/cleanings", json={
+        "equipment_id": "EQ-1", "cleaned_at": "2026-01-02T09:30:00Z",
+        "verified": True}).json()["id"]
+    client.post(f"/cleanings/{cid}/revoke")
+    # 从游标 0 重放全部事件，最终状态应与初始化快照一致
+    state = {}
+    cursor = 0
+    while True:
+        page = _events(client, cursor, limit=2)
+        for ev in page["events"]:
+            state[ev["batch_id"]] = ev["after"]
+        cursor = page["next_cursor"]
+        if not page["has_more"]:
+            break
+    snap = client.get("/changes/snapshot").json()
+    assert set(state) == {b["batch_id"] for b in snap["batches"]}
+    for b in snap["batches"]:
+        assert state[b["batch_id"]]["conclusion"] == b["conclusion"]
+        assert state[b["batch_id"]]["basis"] == b["basis"]
+    # 快照游标之后无事件
+    assert _events(client, snap["cursor"])["events"] == []

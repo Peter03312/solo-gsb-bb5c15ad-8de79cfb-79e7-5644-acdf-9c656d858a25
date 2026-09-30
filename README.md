@@ -14,6 +14,9 @@
 - 原料声明更正、清洗撤销后，**未签发结论按当前有效记录实时重算**；
 - **签发标签**冻结签发时刻的结论与依据，后续变更不改旧标签，
   可签发关联旧版（`supersedes_id`）的新标签；
+- **变更事件订阅**：下游按游标增量同步——初始化读取返回同一状态下的现存批次
+  实时结论与游标，之后分页读取事件（全局递增序号、触发操作、批次号、变更前后
+  完整结论与依据）；业务写入与事件同事务，失败/预演/无实际变化不产事件；
 - 无效时序、来源环、设备时间重叠、批次来源冲突一律**拒绝并保持原状态**
   （校验与写入在同一事务内，失败即回滚）。
 
@@ -89,8 +92,10 @@ pytest tests/ -q
 | GET | `/batches/{batch_id}/trace` | 实时溯源：每项过敏原/待确认的来源路径 + 依据 |
 | POST | `/batches/{batch_id}/labels` | 签发标签（可带 `supersedes_id` 关联旧版） |
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
+| GET | `/changes/snapshot` | 初始化读取：同一状态下的现存批次实时结论 + 游标 |
+| GET | `/changes/events` | 按游标分页读取变更事件（固定上界，无效游标拒绝） |
 
-错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用）；
+错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用、无效游标）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
 预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演）；
 `422` 请求格式错误（如时间缺少时区）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
@@ -136,6 +141,75 @@ curl -s $BASE/cleanings/1/revoke/preview -X POST
 
 # 用上一步返回的 preview_id 原子提交（返回实际影响）
 curl -s $BASE/previews/<preview_id>/commit -X POST
+```
+
+## 变更事件订阅（游标增量同步）
+
+下游系统按“**初始化快照 + 游标增量事件**”两阶段同步溯源变化：
+
+1. **初始化读取** `GET /changes/snapshot`：在一致快照（读事务）内返回
+   `cursor` 与现存全部批次的实时结论（`conclusion`：过敏原/待确认/来源路径）
+   与依据（`basis`：命中的声明版本、清除残留的清洗），按批次号排序。
+2. **增量读取** `GET /changes/events?cursor=<c>&limit=<n>[&upper=<u>]`：
+   从快照游标（或上一页 `next_cursor`）起，按 `seq` 升序分页拉取事件，
+   逐条应用到本地副本即可与线上结论保持一致。
+
+每条事件：
+
+```json
+{
+  "seq": 14,                                  // 全局递增序号
+  "op": "declaration_correction",             // 触发操作
+  "op_ref": {"batch_id": "RM-OAT", "new_version": 4, "via": "direct"},
+  "batch_id": "OUT-OAT-1",                    // 批次号
+  "kind": "product",
+  "before": {"conclusion": {...}, "basis": {...}},   // 变更前完整结论与依据
+  "after":  {"conclusion": {...}, "basis": {...}},   // 变更后完整结论与依据
+  "recorded_at": "2026-09-30T08:00:00Z"
+}
+```
+
+事件生成规则：
+
+- **触发操作**（`op`）：`material_register`（原料登记）、`declaration_correction`
+  （原料更正，含预演提交，`op_ref.via` 区分 `direct` / `preview_commit`）、
+  `processing_register`（加工登记）、`cleaning_register`（清洗登记）、
+  `cleaning_revocation`（清洗撤销，含预演提交）。
+- **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
+- 仅为**结论、来源路径或依据确有变化**的批次生成事件；同次操作的多条事件
+  按批次号排序（`seq` 升序即批次号序）。
+- 业务写入与事件在**同一事务**落库：校验失败回滚、预演（dry-run）均不产事件；
+  未验证清洗、窗口外清洗、标签签发等不改变实时溯源的操作也不产事件，
+  已签发标签永远不改写。
+- 乱序补登加工（插入到同设备两次加工之间）会改变后续批次的残留来源，
+  这类既有批次的结论/路径变化同样产生事件。
+
+分页与游标约定：
+
+- 首页可不传 `upper`，服务端固定本次分页会话的上界为当前最大 `seq` 并在
+  响应中返回；**翻页时原样回传 `upper`**，分页期间的新写入（`seq > upper`）
+  不会进入已开始的读取。
+- 响应字段：`events`、`next_cursor`（下一页游标）、`upper`（固定上界）、
+  `has_more`（`next_cursor < upper`）、`latest`（当前最大序号；
+  `latest > upper` 表示分页期间有新写入，本轮读完后可开启新一轮）。
+- 无效游标（负数、超过当前最大序号、`upper < cursor` 或 `upper` 超界）
+  返回 `400`；非整数参数返回 `422`。
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 初始化：拿到游标与现存批次实时结论
+CURSOR=$(curl -s $BASE/changes/snapshot | python3 -c 'import sys,json;print(json.load(sys.stdin)["cursor"])')
+
+# 2) 增量：首页（服务端固定上界 upper）
+curl -s "$BASE/changes/events?cursor=$CURSOR&limit=100"
+# -> {"events":[...], "next_cursor":N, "upper":U, "has_more":true, "latest":L}
+
+# 3) 翻页：回传固定上界，直到 has_more=false
+curl -s "$BASE/changes/events?cursor=N&limit=100&upper=U"
+
+# 4) 本轮读完后，用 next_cursor 开启新一轮（重新固定上界）
+curl -s "$BASE/changes/events?cursor=U&limit=100"
 ```
 
 ## 调用示例（curl）
@@ -199,10 +273,10 @@ curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
 ```
 app/
   main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、标签签发
-  db.py        # SQLite 连接、建表、写事务
+  service.py   # 业务规则：校验、溯源计算、标签签发、变更预演、变更事件流
+  db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
-tests/test_app.py   # 28 个端到端测试
-examples/demo.sh    # 全流程 curl 演示
+tests/test_app.py   # 39 个端到端测试
+examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

@@ -21,7 +21,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 
-from .db import write_tx
+from .db import read_tx, write_tx
 
 
 class NotFound(Exception):
@@ -111,6 +111,7 @@ def create_material(conn: sqlite3.Connection, data) -> dict:
         kind, _ = batch_kind(conn, data.batch_id)
         if kind:
             raise Conflict(f"批次 {data.batch_id} 已存在（{kind}），不能重复登记")
+        before_views = _snapshot_views(conn)
         conn.execute(
             "INSERT INTO material_batches (batch_id, created_at) VALUES (?, ?)",
             (data.batch_id, declared_at),
@@ -120,6 +121,8 @@ def create_material(conn: sqlite3.Connection, data) -> dict:
             " VALUES (?, 1, ?, ?, ?)",
             (data.batch_id, json.dumps(data.allergens), int(data.pending), declared_at),
         )
+        _record_events(conn, "material_register",
+                       {"batch_id": data.batch_id, "version": 1}, before_views)
     return get_material(conn, data.batch_id)
 
 
@@ -129,12 +132,16 @@ def add_declaration(conn: sqlite3.Connection, batch_id: str, data) -> dict:
         if not _material(conn, batch_id):
             raise NotFound(f"未知原料批次: {batch_id}")
         cur = _current_declaration(conn, batch_id)
+        before_views = _snapshot_views(conn)
         conn.execute(
             "INSERT INTO material_declarations (batch_id, version, allergens, pending, declared_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (batch_id, cur["version"] + 1, json.dumps(data.allergens),
              int(data.pending), declared_at),
         )
+        _record_events(conn, "declaration_correction",
+                       {"batch_id": batch_id, "new_version": cur["version"] + 1,
+                        "via": "direct"}, before_views)
     return get_material(conn, batch_id)
 
 
@@ -211,6 +218,7 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
                     f"已有加工 {row['processing_id']}，时间重叠"
                 )
 
+        before_views = _snapshot_views(conn)
         conn.execute(
             "INSERT INTO processings (processing_id, equipment_id, start_utc, end_utc)"
             " VALUES (?, ?, ?, ?)",
@@ -226,6 +234,8 @@ def create_processing(conn: sqlite3.Connection, data) -> dict:
                 "INSERT INTO processing_outputs (processing_id, batch_id) VALUES (?, ?)",
                 (data.processing_id, out_id),
             )
+        _record_events(conn, "processing_register",
+                       {"processing_id": data.processing_id}, before_views)
     return get_processing(conn, data.processing_id)
 
 
@@ -285,12 +295,15 @@ def list_processings(conn: sqlite3.Connection) -> list[dict]:
 
 def create_cleaning(conn: sqlite3.Connection, data) -> dict:
     with write_tx(conn):
+        before_views = _snapshot_views(conn)
         cur = conn.execute(
             "INSERT INTO cleanings (equipment_id, cleaned_at, verified, revoked)"
             " VALUES (?, ?, ?, 0)",
             (data.equipment_id, to_store(data.cleaned_at), int(data.verified)),
         )
         cid = cur.lastrowid
+        # 未验证清洗、不在任何残留窗口内的清洗不改变实时溯源 -> 对比后无事件
+        _record_events(conn, "cleaning_register", {"cleaning_id": cid}, before_views)
     return get_cleaning(conn, cid)
 
 
@@ -325,7 +338,10 @@ def revoke_cleaning(conn: sqlite3.Connection, cleaning_id: int) -> dict:
             raise NotFound(f"未知清洗记录: {cleaning_id}")
         if row["revoked"]:
             raise Conflict(f"清洗记录 {cleaning_id} 已撤销")
+        before_views = _snapshot_views(conn)
         conn.execute("UPDATE cleanings SET revoked = 1 WHERE id = ?", (cleaning_id,))
+        _record_events(conn, "cleaning_revocation",
+                       {"cleaning_id": cleaning_id, "via": "direct"}, before_views)
     return get_cleaning(conn, cleaning_id)
 
 
@@ -488,6 +504,116 @@ def trace_response(conn: sqlite3.Connection, batch_id: str) -> dict:
         "kind": kind,
         **view["conclusion"],
         "basis": view["basis"],
+    }
+
+
+# ---------------------------------------------------------------- 变更事件流
+#
+# 下游系统按游标增量消费溯源变化：每次业务写入在**同一事务**内先取全部批次
+# 实时视图快照，写入后重算并对比，仅为“新批次（前态为空）”与“结论/来源路径/
+# 依据确有变化”的批次落事件；同次操作的事件按批次号排序插入（seq 即有序）。
+# 校验失败回滚、预演（dry-run）不落任何事件；未验证清洗、标签签发等不改变
+# 实时溯源的操作经对比自然不产生事件。
+
+def _snapshot_views(conn: sqlite3.Connection) -> dict:
+    """当前全部批次的实时视图（结论 + 依据），{batch_id: view}。"""
+    return {bid: trace_view(conn, bid) for bid in _all_batch_ids(conn)}
+
+
+def _record_events(conn: sqlite3.Connection, op: str, op_ref: dict,
+                   before_views: dict) -> list[str]:
+    """写事务内调用：重算全部批次视图并与 before_views 对比，为新批次与
+    确有变化的批次按批次号顺序落事件。返回产生事件的批次号列表。"""
+    after_views = _snapshot_views(conn)
+    changed = []
+    for bid, after in after_views.items():
+        before = before_views.get(bid)
+        if before is None or _view_key(before) != _view_key(after):
+            changed.append((bid, before, after))
+    changed.sort(key=lambda item: item[0])  # 同次操作按批次号排序
+    now = to_store(now_utc())
+    ref = json.dumps(op_ref, ensure_ascii=False, sort_keys=True)
+    for bid, before, after in changed:
+        kind, _ = batch_kind(conn, bid)
+        conn.execute(
+            "INSERT INTO trace_events"
+            " (op, op_ref, batch_id, kind, before_view, after_view, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (op, ref, bid, kind,
+             json.dumps(before, ensure_ascii=False, sort_keys=True)
+             if before is not None else None,
+             json.dumps(after, ensure_ascii=False, sort_keys=True),
+             now),
+        )
+    return [bid for bid, _, _ in changed]
+
+
+def _max_event_seq(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(seq) AS s FROM trace_events").fetchone()
+    return row["s"] or 0
+
+
+def _event_view(row) -> dict:
+    return {
+        "seq": row["seq"],
+        "op": row["op"],
+        "op_ref": json.loads(row["op_ref"]),
+        "batch_id": row["batch_id"],
+        "kind": row["kind"],
+        "before": (json.loads(row["before_view"])
+                   if row["before_view"] is not None else None),
+        "after": json.loads(row["after_view"]),
+        "recorded_at": iso_z(row["created_at"]),
+    }
+
+
+def changes_snapshot(conn: sqlite3.Connection) -> dict:
+    """初始化读取：同一状态（读事务一致快照）下的现存批次实时结论与游标。
+    之后以该游标调用事件接口即可不重不漏地接续增量变化。"""
+    with read_tx(conn):
+        cursor = _max_event_seq(conn)
+        batches = []
+        for bid in _all_batch_ids(conn):
+            kind, _ = batch_kind(conn, bid)
+            view = trace_view(conn, bid)
+            batches.append({
+                "batch_id": bid,
+                "kind": kind,
+                "conclusion": view["conclusion"],
+                "basis": view["basis"],
+            })
+    return {"cursor": cursor, "batches": batches}
+
+
+def list_change_events(conn: sqlite3.Connection, cursor: int, limit: int,
+                       upper: int | None) -> dict:
+    """按游标分页读取事件：返回 (cursor, upper] 内按 seq 升序的事件。
+
+    upper 为本次分页会话的固定上界：首页缺省取当前最大序号，翻页时原样回传，
+    分页期间的新写入（seq > upper）不会进入已开始的读取。无效游标拒绝。
+    """
+    with read_tx(conn):
+        max_seq = _max_event_seq(conn)
+        if cursor < 0 or cursor > max_seq:
+            raise BadRequest(f"无效游标: {cursor}（当前有效范围 0..{max_seq}）")
+        if upper is None:
+            upper = max_seq
+        elif upper < cursor or upper > max_seq:
+            raise BadRequest(
+                f"无效上界游标: {upper}（需满足 cursor <= upper <= {max_seq}）")
+        rows = conn.execute(
+            "SELECT * FROM trace_events WHERE seq > ? AND seq <= ?"
+            " ORDER BY seq LIMIT ?",
+            (cursor, upper, limit),
+        ).fetchall()
+        events = [_event_view(r) for r in rows]
+        next_cursor = events[-1]["seq"] if events else cursor
+    return {
+        "events": events,
+        "next_cursor": next_cursor,
+        "upper": upper,
+        "has_more": next_cursor < upper,
+        "latest": max_seq,
     }
 
 
@@ -965,11 +1091,16 @@ def commit_declaration(conn: sqlite3.Connection, preview_id: str) -> dict:
             raise Conflict(
                 "影响本次差异的记录自预演后已变化，请重新预演后再提交"
                 "（无关记录更新不影响凭据）")
+        before_views = _snapshot_views(conn)
         conn.execute(
             "INSERT INTO material_declarations (batch_id, version, allergens, pending, declared_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (batch_id, cur["version"] + 1, json.dumps(payload["allergens"]),
              int(payload["pending"]), payload["declared_at"]))
+        _record_events(conn, "declaration_correction",
+                       {"batch_id": batch_id, "new_version": cur["version"] + 1,
+                        "via": "preview_commit", "preview_id": preview_id},
+                       before_views)
         applied_at = iso_z(to_store(now_utc()))
         change = {
             "type": "declaration_correction",
@@ -1038,7 +1169,11 @@ def commit_revoke_cleaning(conn: sqlite3.Connection, preview_id: str) -> dict:
             raise Conflict(
                 "影响本次差异的记录自预演后已变化，请重新预演后再提交"
                 "（无关记录更新不影响凭据）")
+        before_views = _snapshot_views(conn)
         conn.execute("UPDATE cleanings SET revoked = 1 WHERE id = ?", (cleaning_id,))
+        _record_events(conn, "cleaning_revocation",
+                       {"cleaning_id": cleaning_id, "via": "preview_commit",
+                        "preview_id": preview_id}, before_views)
         applied_at = iso_z(to_store(now_utc()))
         change = {
             "type": "cleaning_revocation",

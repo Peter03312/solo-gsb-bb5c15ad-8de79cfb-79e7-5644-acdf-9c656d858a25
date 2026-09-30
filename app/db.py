@@ -60,6 +60,21 @@ CREATE TABLE IF NOT EXISTS labels (
     supersedes_id INTEGER REFERENCES labels(id),
     snapshot      TEXT NOT NULL
 );
+
+-- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
+-- seq 全局递增；同一次操作产生的多条事件按批次号排序（插入序即批次号序）。
+CREATE TABLE IF NOT EXISTS trace_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局递增序号
+    op          TEXT NOT NULL,       -- 触发操作类型（登记/更正/撤销/预演提交等）
+    op_ref      TEXT NOT NULL,       -- JSON：操作定位信息（加工号/清洗 id/声明版本/凭据等）
+    batch_id    TEXT NOT NULL,       -- 批次号
+    kind        TEXT NOT NULL,       -- material / product
+    before_view TEXT,                -- JSON：变更前完整结论与依据；新批次为 NULL
+    after_view  TEXT NOT NULL,       -- JSON：变更后完整结论与依据
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_events_batch ON trace_events(batch_id);
 """
 
 
@@ -93,3 +108,14 @@ def write_tx(conn: sqlite3.Connection):
         conn.rollback()
         raise
     conn.commit()
+
+
+@contextmanager
+def read_tx(conn: sqlite3.Connection):
+    """读事务：WAL 下为多个查询提供一致快照（初始化读取/分页读取看到同一状态），
+    不阻塞并发写入。"""
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()  # 只读事务，结束即释放（等效提交）
